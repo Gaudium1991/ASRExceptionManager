@@ -165,6 +165,13 @@ Contributions, improvements, and suggestions are welcome!
 
 Feel free to open issues or submit pull requests.
 
+📄 License
+
+This project is licensed under the MIT License.
+See the [LICENSE](LICENSE) file for details.
+
+Copyright (c) 2026 Guido Imperatore
+
 📄 Disclaimer
 
 This tool is provided as-is without warranty.
@@ -172,5 +179,5 @@ Use at your own risk in production environments.
 
 👨‍💻 Author
 
-Created for the community ❤️
+Created by Guido Imperatore for the community ❤️
 to simplify ASR management in enterprise environments.
