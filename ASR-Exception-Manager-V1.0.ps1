@@ -425,7 +425,7 @@ function Get-AsrRuleDisplay {
     $afObj = $null
     try {
         if ($af -is [string] -and -not [string]::IsNullOrWhiteSpace($af)) {
-            $afObj = $af | ConvertFrom-Json -Depth 100 -ErrorAction Stop
+            $afObj = $af | ConvertFrom-Json -ErrorAction Stop
         }
         elseif ($af -and $af -isnot [string]) {
             $afObj = $af
@@ -753,18 +753,107 @@ function Find-AsrGlobalExclusionsSetting {
         } catch {}
 
         $blob = ($tokens -join ' | ')
-        $isGlobalByText = $blob -match '(?i)attack surface reduction only exclusions'
+
+        # Blob normalizzato: rimuovo tutto tranne lettere/cifre minuscole così che sia
+        # il settingDefinitionId concatenato ("...attacksurfacereductiononlyexclusions")
+        # sia il displayName con gli spazi ("Attack Surface Reduction Only Exclusions")
+        # vengano riconosciuti allo stesso modo, a prescindere dalla lingua del tenant.
+        $normBlob = [regex]::Replace($blob.ToLowerInvariant(), '[^a-z0-9]', '')
+
         $isSimpleCollection = $false
         try {
-            $isSimpleCollection = ($null -ne $s.settingInstance.simpleSettingCollectionValue)
+            $isSimpleCollection = ($null -ne $s.settingInstance.simpleSettingCollectionValue) -or
+                ([string]$s.settingInstance.'@odata.type' -match 'SimpleSettingCollectionInstance')
         } catch {}
 
-        if ($isGlobalByText -or ($isSimpleCollection -and $blob -match '(?i)exclude|exclusion' -and $blob -match '(?i)attack surface reduction|\bASR\b|asr')) {
+        # Il setting per-rule contiene "perruleexclusions": lo escludo esplicitamente
+        # per non confonderlo con quello globale.
+        $isPerRule = $normBlob -match 'perruleexclusions'
+
+        # Match primario e indipendente dalla lingua: id canonico del setting globale.
+        $isGlobalById = $normBlob -match 'attacksurfacereductiononlyexclusions'
+
+        # Match secondario: qualsiasi collection ASR di esclusioni che NON sia il per-rule.
+        $isGlobalByText = (-not $isPerRule) -and $isSimpleCollection -and
+            ($normBlob -match 'exclu') -and ($normBlob -match 'attacksurfacereduction|\basr')
+
+        if ($isGlobalById -or $isGlobalByText) {
             return $s
         }
     }
 
     return $null
+}
+
+$script:AsrGlobalExclusionDefinitionId = 'device_vendor_msft_policy_config_defender_attacksurfacereductiononlyexclusions'
+
+function Get-AsrGlobalExclusionTemplateRef {
+    # Le policy Endpoint Security ASR sono create da un template: ogni settingInstance
+    # DEVE avere un settingInstanceTemplateReference valido. Qui leggo dal template stesso
+    # il settingInstanceTemplateId corretto per il setting "Attack Surface Reduction Only
+    # Exclusions", così da poterlo creare senza errori "TemplateReference not found".
+    param(
+        [Parameter(Mandatory=$true)]$Policy,
+        [Parameter(Mandatory=$true)][hashtable]$Headers
+    )
+
+    $templateId = $null
+    try { $templateId = [string]$Policy.RawPolicy.templateReference.templateId } catch {}
+    if ([string]::IsNullOrWhiteSpace($templateId)) {
+        Write-Log 'Policy senza templateReference: nessun template da cui leggere il riferimento.'
+        return $null
+    }
+
+    $uri = "https://graph.microsoft.com/beta/deviceManagement/configurationPolicyTemplates('$templateId')/settingTemplates?`$expand=settingDefinitions"
+    $settingTemplates = @()
+    try {
+        $settingTemplates = Get-AllPages -Uri $uri -Headers $Headers
+    }
+    catch {
+        Write-Log "Impossibile leggere i settingTemplates del template $templateId : $($_.Exception.Message)"
+        return $null
+    }
+
+    foreach ($st in $settingTemplates) {
+        $inst = $null
+        try { $inst = $st.settingInstanceTemplate } catch {}
+        if ($null -eq $inst) { continue }
+        if ([string]$inst.settingDefinitionId -eq $script:AsrGlobalExclusionDefinitionId) {
+            return [pscustomobject]@{
+                SettingInstanceTemplateId = [string]$inst.settingInstanceTemplateId
+                OdataType                 = [string]$inst.'@odata.type'
+            }
+        }
+    }
+
+    Write-Log "Setting globale non presente tra i settingTemplates del template $templateId."
+    return $null
+}
+
+function New-AsrGlobalExclusionSettingObject {
+    param(
+        [Parameter(Mandatory=$true)][string]$Value,
+        [string]$SettingInstanceTemplateId
+    )
+
+    # In una policy da template il riferimento è obbligatorio; su policy "settings catalog"
+    # puro resta $null (accettato).
+    $tmplRef = $null
+    if (-not [string]::IsNullOrWhiteSpace($SettingInstanceTemplateId)) {
+        $tmplRef = [pscustomobject]@{ settingInstanceTemplateId = $SettingInstanceTemplateId }
+    }
+
+    # Struttura del setting "Attack Surface Reduction Only Exclusions" (esclusioni ASR globali)
+    # da usare quando la policy selezionata non contiene ancora questo setting.
+    return [pscustomobject]@{
+        id = [guid]::NewGuid().ToString()
+        settingInstance = [pscustomobject]@{
+            '@odata.type'                    = '#microsoft.graph.deviceManagementConfigurationSimpleSettingCollectionInstance'
+            settingDefinitionId              = $script:AsrGlobalExclusionDefinitionId
+            settingInstanceTemplateReference = $tmplRef
+            simpleSettingCollectionValue     = @((New-StringSettingValueObject -Value $Value))
+        }
+    }
 }
 
 function Find-AsrPerRuleExclusionsSetting {
@@ -873,7 +962,7 @@ function Get-EventAdditionalFieldsObject {
         if ($Event.PSObject.Properties.Match('AdditionalFields').Count -eq 0) { return $null }
         $af = $Event.AdditionalFields
         if ($af -is [string] -and -not [string]::IsNullOrWhiteSpace($af)) {
-            return ($af | ConvertFrom-Json -Depth 100 -ErrorAction Stop)
+            return ($af | ConvertFrom-Json -ErrorAction Stop)
         }
         elseif ($af -and $af -isnot [string]) {
             return $af
@@ -1048,7 +1137,7 @@ function Add-ValueToSettingInstance {
         [switch]$PreferPerRule
     )
 
-    $clone = $Setting | ConvertTo-Json -Depth 100 | ConvertFrom-Json -Depth 100
+    $clone = $Setting | ConvertTo-Json -Depth 100 | ConvertFrom-Json
     $inst = $clone.settingInstance
     if ($null -eq $inst) {
         throw 'settingInstance non trovato nel setting.'
@@ -1088,7 +1177,7 @@ function Add-ValueToSettingInstance {
 function Convert-SettingForPolicyPut {
     param([Parameter(Mandatory=$true)]$Setting)
 
-    $clean = $Setting | ConvertTo-Json -Depth 100 | ConvertFrom-Json -Depth 100
+    $clean = $Setting | ConvertTo-Json -Depth 100 | ConvertFrom-Json
     if ($clean.PSObject.Properties.Name -contains 'settingDefinitions') {
         $clean.PSObject.Properties.Remove('settingDefinitions')
     }
@@ -1109,13 +1198,21 @@ function Build-PolicyPutBody {
     )
 
     $settingsForPut = @()
+    $found = $false
     foreach ($s in $AllSettings) {
         if ([string]$s.id -eq [string]$UpdatedSetting.id) {
             $settingsForPut += ,(Convert-SettingForPolicyPut -Setting $UpdatedSetting)
+            $found = $true
         }
         else {
             $settingsForPut += ,(Convert-SettingForPolicyPut -Setting $s)
         }
+    }
+
+    # Se il setting aggiornato non era presente nella policy (es. il setting globale
+    # "Attack Surface Reduction Only Exclusions" mai configurato), lo aggiungo in coda.
+    if (-not $found) {
+        $settingsForPut += ,(Convert-SettingForPolicyPut -Setting $UpdatedSetting)
     }
 
     return [ordered]@{
@@ -1737,12 +1834,26 @@ $btnApply.Add_Click({
 
         if ($mustApplyGlobal) {
             if (-not $globalSetting) {
-                throw 'Non trovo il setting "Attack Surface Reduction Only Exclusions" nella policy selezionata.'
+                # Il setting globale non è presente nella policy: lo creo e lo aggiungo.
+                Write-Log 'Setting "Attack Surface Reduction Only Exclusions" non presente nella policy: lo creo e lo aggiungo alla policy.'
+                $globalTmpl = Get-AsrGlobalExclusionTemplateRef -Policy $policy -Headers $script:Headers
+                $globalTmplId = $null
+                if ($globalTmpl) { $globalTmplId = $globalTmpl.SettingInstanceTemplateId }
+                if (-not [string]::IsNullOrWhiteSpace($globalTmplId)) {
+                    Write-Log "Template reference per il setting globale: $globalTmplId"
+                }
+                else {
+                    Write-Log 'ATTENZIONE: nessun template reference trovato per il setting globale; provo senza (potrebbe fallire su policy da template).'
+                }
+                $updatedGlobal = New-AsrGlobalExclusionSettingObject -Value $exclusion -SettingInstanceTemplateId $globalTmplId
+                $refSetting = $updatedGlobal
             }
-
-            Write-Log 'Applico l''esclusione al setting globale: Attack Surface Reduction Only Exclusions.'
-            $updatedGlobal = Add-ValueToSettingInstance -Setting $globalSetting -Event $script:SelectedEvent -NewValue $exclusion
-            $null = Update-PolicySetting -Policy $policy -Setting $globalSetting -BodyObject $updatedGlobal -Headers $script:Headers
+            else {
+                Write-Log 'Applico l''esclusione al setting globale: Attack Surface Reduction Only Exclusions.'
+                $updatedGlobal = Add-ValueToSettingInstance -Setting $globalSetting -Event $script:SelectedEvent -NewValue $exclusion
+                $refSetting = $globalSetting
+            }
+            $null = Update-PolicySetting -Policy $policy -Setting $refSetting -BodyObject $updatedGlobal -Headers $script:Headers
             Start-Sleep -Seconds 2
             $freshSettings = Refresh-CurrentPolicyCandidateSettings -PolicyIndex $policyIndex -Headers $script:Headers
             $policy = $script:CurrentPolicyCandidates[$policyIndex]
@@ -1803,6 +1914,8 @@ Write-Log '- Group.Read.All / Directory.Read.All'
 Write-Log 'Nota: la modifica diretta della policy impatta tutti i device assegnati a quella policy/gruppo.'
 Write-Log 'Per troubleshooting usa il pulsante "Dump setting JSON".'
 Write-Log 'V1.7: toggle automatico Global Exclusion + fix lookup device Intune con fallback hostname senza dominio.'
+Write-Log 'V1.1-fix: riconoscimento del setting "Attack Surface Reduction Only Exclusions" via settingDefinitionId (indipendente dalla lingua) e creazione automatica del setting globale se assente nella policy.'
+Write-Log 'V1.1-fix2: compatibilita PowerShell 5.1 (rimosso -Depth da ConvertFrom-Json) e settingInstanceTemplateReference letto dal template per le policy Endpoint Security ASR.'
 Write-Log 'Per Endpoint Security / ASR lo script usa PUT su configurationPolicies, in linea con il payload pubblico mostrato da Microsoft per questi profili.'
 
 $form.Add_Shown({ Update-UiLayout })
