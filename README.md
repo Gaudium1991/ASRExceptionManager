@@ -83,7 +83,7 @@ Directory.Read.All
 
 ⚙️ Requirements
 
-PowerShell 5.1 or higher
+PowerShell 7 or higher
 
 Microsoft Defender for Endpoint (enabled)
 
